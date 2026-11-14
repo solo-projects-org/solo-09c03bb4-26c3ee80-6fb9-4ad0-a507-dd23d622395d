@@ -72,10 +72,10 @@ def env_stack(tmp_path_factory):
             time.sleep(0.3)
         raise RuntimeError(f"端口 {port} 长时间被占用")
 
-    # 1) 生成虚构 CT
+    # 1) 生成虚构 CT（第 4 个检查留给剂量“无已完成批”场景，不做取数以外的批）
     gen = subprocess.run(
         [sys.executable, "-m", "simulator.generate_data",
-         "--out", str(pacs_data), "--counts", "6,5,4"],
+         "--out", str(pacs_data), "--counts", "6,5,4,3"],
         cwd=ROOT, check=True, capture_output=True, text=True,
     )
     assert gen.returncode == 0
@@ -212,8 +212,10 @@ def test_01_health_and_pacs_listing(env_stack):
     r = requests.get(f"{env_stack['base']}/health", timeout=5)
     assert r.ok and r.json()["status"] == "ok"
     studies = _studies(env_stack)
-    assert len(studies) == 3
+    assert len(studies) == 4
     assert all(s["modality"] == "CT" for s in studies)
+    # 每个虚构检查均为双序列（剂量按序列汇总的前提）
+    assert all(len(s["series"]) == 2 for s in studies)
 
 
 def test_02_happy_path_completes_and_zip_matches_manifest(env_stack):
@@ -256,7 +258,7 @@ def test_03_parallel_batches_interleave_without_blocking(env_stack):
     studies = _studies(env_stack)
     t0 = time.time()
     ids = []
-    for s in studies[1:]:
+    for s in studies[1:3]:  # 第 4 个检查留给 test_10 的“无已完成批”场景
         r = requests.post(f"{env_stack['base']}/batches",
                           json={"study_instance_uid": s["study_instance_uid"]},
                           timeout=10)
@@ -487,7 +489,6 @@ def test_09_restart_recovery(env_stack):
     # 先确认已有完成批
     batches = requests.get(f"{env_stack['base']}/batches", timeout=5).json()
     completed = next(b for b in batches if b["state"] == "COMPLETED")
-
     # 制造一个“进行中”的批：直接在 DB 里插入 MOVING 批并写清单，
     # 模拟进程在回传中途被杀
     import sqlite3
@@ -540,3 +541,161 @@ def test_09_restart_recovery(env_stack):
         assert dl.status_code == 200
     finally:
         pass
+
+
+def test_10_dose_aggregation_versioning_and_raw(env_stack):
+    """剂量归集：受理/去重/冲突拒绝/修订换版/原件溯源的完整 HTTP 流程。"""
+    from simulator import dose_export
+
+    base = env_stack["base"]
+    studies = _studies(env_stack)
+    study = studies[0]["study_instance_uid"]
+    series = studies[0]["series"]
+    assert len(series) == 2, "虚构 CT 应为双序列"
+
+    # 该检查已有完成批（test_02/07）；为防顺序变化，确保存在一个完成批
+    r = requests.post(f"{base}/batches",
+                      json={"study_instance_uid": study}, timeout=10)
+    assert r.status_code == 201
+    view = _wait_terminal(env_stack, r.json()["id"])
+    assert view["state"] == "COMPLETED"
+
+    # ---- 受理首份导出：按序列汇总正确 ----
+    export = dose_export.build_dose_export(study, series)
+    r = requests.post(f"{base}/dose-exports", json=export, timeout=10)
+    assert r.status_code == 201, r.text
+    v1 = r.json()
+    assert v1["version"] == 1
+    assert v1["series_count"] == 2
+    assert v1["event_count"] == len(export["events"])
+    expected_total = round(sum(e["dlp_mgy_cm"] for e in export["events"]), 6)
+    assert v1["total_dlp_mgy_cm"] == expected_total
+    by_series = {s["series_instance_uid"]: s for s in v1["series"]}
+    for s_uid in series:
+        exp = [e for e in export["events"]
+               if e["series_instance_uid"] == s_uid]
+        assert by_series[s_uid]["event_count"] == len(exp)
+        assert by_series[s_uid]["total_dlp_mgy_cm"] == round(
+            sum(e["dlp_mgy_cm"] for e in exp), 6)
+        assert {e["irradiation_event_uid"] for e in by_series[s_uid]["events"]} \
+            == {e["irradiation_event_uid"] for e in exp}
+
+    # ---- 原件逐字节留存 ----
+    raw = requests.get(f"{base}/dose-exports/{study}/raw", timeout=10)
+    assert raw.status_code == 200
+    assert raw.json() == export
+
+    # ---- 完全一致的重复：计一次 ----
+    dup = dose_export.with_identical_duplicates(export)
+    r = requests.post(f"{base}/dose-exports", json=dup, timeout=10)
+    assert r.status_code == 201
+    v2 = r.json()
+    assert v2["version"] == 2
+    assert v2["event_count"] == v1["event_count"]
+    assert v2["total_dlp_mgy_cm"] == v1["total_dlp_mgy_cm"]
+
+    # ---- 冲突重复：整份拒绝，当前版本不变 ----
+    conflict = dose_export.with_conflicting_duplicate(export)
+    r = requests.post(f"{base}/dose-exports", json=conflict, timeout=10)
+    assert r.status_code == 422
+    cur = requests.get(f"{base}/dose-exports/{study}", timeout=10).json()
+    assert cur["version"] == 2
+
+    # ---- 未登记序列：整份拒绝 ----
+    bogus = dose_export.with_unknown_series(
+        export, "1.2.826.0.1.3680043.8.498.999999")
+    r = requests.post(f"{base}/dose-exports", json=bogus, timeout=10)
+    assert r.status_code == 422
+
+    # ---- 修订：新版本原子生效，旧版不可变且可溯源 ----
+    revision = dose_export.revised_export(export)
+    r = requests.post(f"{base}/dose-exports", json=revision, timeout=10)
+    assert r.status_code == 201
+    v3 = r.json()
+    assert v3["version"] == 3
+    assert v3["total_dlp_mgy_cm"] != v1["total_dlp_mgy_cm"]
+
+    versions = requests.get(f"{base}/dose-exports/{study}/versions",
+                            timeout=10).json()
+    assert [v["version"] for v in versions] == [3, 2, 1]
+    assert [v["is_current"] for v in versions] == [True, False, False]
+
+    old = requests.get(f"{base}/dose-exports/{study}/versions/1",
+                       timeout=10).json()
+    assert old["total_dlp_mgy_cm"] == v1["total_dlp_mgy_cm"]
+    raw_v1 = requests.get(f"{base}/dose-exports/{study}/versions/1/raw",
+                          timeout=10)
+    assert raw_v1.json() == export
+    raw_cur = requests.get(f"{base}/dose-exports/{study}/raw", timeout=10)
+    assert raw_cur.json() == revision
+
+    # ---- 列表端点 ----
+    listing = requests.get(f"{base}/dose-exports", timeout=10).json()
+    assert any(item["study_instance_uid"] == study and item["version"] == 3
+               for item in listing)
+
+    # ---- 未取数检查 404；无任何已完成批的检查 409 ----
+    r = requests.post(
+        f"{base}/dose-exports",
+        json=dose_export.build_dose_export("1.2.826.0.1.3680043.8.498.777",
+                                           ["1.2.826.0.1.3680043.8.498.778"]),
+        timeout=10)
+    assert r.status_code == 404
+
+    # 第 4 个检查从未取数：新批进行中时剂量导出不受理
+    study_d = studies[3]["study_instance_uid"]
+    rb = requests.post(f"{base}/batches",
+                       json={"study_instance_uid": study_d}, timeout=10)
+    assert rb.status_code == 201
+    r = requests.post(
+        f"{base}/dose-exports",
+        json=dose_export.build_dose_export(study_d, studies[3]["series"]),
+        timeout=10)
+    assert r.status_code == 409, r.text  # 只受理已完成批
+    view_d = _wait_terminal(env_stack, rb.json()["id"])
+    assert view_d["state"] == "COMPLETED"
+    # 完成后即可受理
+    r = requests.post(
+        f"{base}/dose-exports",
+        json=dose_export.build_dose_export(study_d, studies[3]["series"]),
+        timeout=10)
+    assert r.status_code == 201
+
+
+def test_11_dose_survives_restart(env_stack):
+    """重启后已发布剂量版本保持完好：上次完整版本不丢、不混版。"""
+    base = env_stack["base"]
+    studies = _studies(env_stack)
+    study = studies[0]["study_instance_uid"]
+    before = requests.get(f"{base}/dose-exports/{study}", timeout=10).json()
+    assert before["version"] >= 1
+    raw_before = requests.get(f"{base}/dose-exports/{study}/raw",
+                              timeout=10).json()
+
+    # 杀掉 API 进程并以同一数据卷重启（与 test_09 相同的真实重启）
+    proc = env_stack["api_proc"]
+    proc.terminate()
+    proc.wait(timeout=10)
+    restart_log = open(env_stack["log_dir"] / "api-restart2.log", "w")
+    restarted = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app.main:app",
+         "--host", "127.0.0.1", "--port", str(env_stack["http_port"]),
+         "--log-level", "warning"],
+        cwd=ROOT, env=env_stack["api_env"], start_new_session=True,
+        stdout=restart_log, stderr=subprocess.STDOUT, text=True,
+    )
+    env_stack["api_proc"] = restarted
+    env_stack["spawned"].append(restarted)
+    env_stack["log_handles"].append(restart_log)
+
+    _wait_http(f"{base}/health")
+    after = requests.get(f"{base}/dose-exports/{study}", timeout=10).json()
+    assert after["version"] == before["version"]
+    assert after["total_dlp_mgy_cm"] == before["total_dlp_mgy_cm"]
+    assert after["event_count"] == before["event_count"]
+    raw_after = requests.get(f"{base}/dose-exports/{study}/raw", timeout=10)
+    assert raw_after.status_code == 200
+    assert raw_after.json() == raw_before
+    versions = requests.get(f"{base}/dose-exports/{study}/versions",
+                            timeout=10).json()
+    assert len(versions) == before["version"]

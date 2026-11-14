@@ -9,6 +9,10 @@
 * 文件与登记在同一事务边界内处理：调用方先把文件写好并 fsync，再调用
   ``register_instance``；登记失败时调用方负责删除已写文件，保证
   “文件写完且登记成功才回复 C-STORE 成功”。
+* 剂量导出按 ``(study_instance_uid, version)`` 版本化：
+  ``publish_dose_version`` 把版本行、事件行与“当前版本”指针放在
+  **同一事务** 提交，读者永远只看到完整版本；并发修订由
+  :class:`app.dose.DoseService` 的修订锁串行化，不会产生混合版本。
 """
 from __future__ import annotations
 
@@ -85,6 +89,7 @@ class Database:
                     sop_instance_uid    TEXT NOT NULL,
                     sop_class_uid       TEXT NOT NULL,
                     transfer_syntax     TEXT NOT NULL,
+                    series_instance_uid TEXT NOT NULL DEFAULT '',
                     file_path           TEXT NOT NULL,
                     received_at         TEXT NOT NULL,
                     PRIMARY KEY (batch_id, sop_instance_uid)
@@ -99,7 +104,57 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_batch
                     ON events(batch_id, id);
+
+                -- 剂量导出：每个检查一个版本序列，版本不可变、只增不改。
+                -- “当前版本”指针与版本行/事件行在同一事务提交，
+                -- 读者按指针取到的永远是完整版本（汇总+原件同版）。
+                CREATE TABLE IF NOT EXISTS dose_versions (
+                    study_instance_uid  TEXT NOT NULL,
+                    version             INTEGER NOT NULL,
+                    batch_id            TEXT NOT NULL
+                        REFERENCES batches(id) ON DELETE CASCADE,
+                    export_id           TEXT NOT NULL DEFAULT '',
+                    event_count         INTEGER NOT NULL,
+                    series_count        INTEGER NOT NULL,
+                    total_dlp_mgy_cm    REAL NOT NULL,
+                    raw_path            TEXT NOT NULL,
+                    created_at          TEXT NOT NULL,
+                    PRIMARY KEY (study_instance_uid, version)
+                );
+
+                CREATE TABLE IF NOT EXISTS dose_events (
+                    study_instance_uid      TEXT NOT NULL,
+                    version                 INTEGER NOT NULL,
+                    irradiation_event_uid   TEXT NOT NULL,
+                    series_instance_uid     TEXT NOT NULL,
+                    ctdi_vol_mgy            REAL NOT NULL,
+                    dlp_mgy_cm              REAL NOT NULL,
+                    seq                     INTEGER NOT NULL,
+                    PRIMARY KEY (study_instance_uid, version, irradiation_event_uid),
+                    FOREIGN KEY (study_instance_uid, version)
+                        REFERENCES dose_versions(study_instance_uid, version)
+                        ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS dose_current (
+                    study_instance_uid  TEXT PRIMARY KEY,
+                    version             INTEGER NOT NULL,
+                    updated_at          TEXT NOT NULL
+                );
                 """
+            )
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """老库就地升级：instances 补 series_instance_uid 列。"""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(instances)")
+        }
+        if "series_instance_uid" not in cols:
+            self._conn.execute(
+                "ALTER TABLE instances ADD COLUMN "
+                "series_instance_uid TEXT NOT NULL DEFAULT ''"
             )
 
     def close(self) -> None:
@@ -220,12 +275,12 @@ class Database:
 
     # ------------------------------------------------------------------ manifest
     def set_manifest(
-        self, batch_id: str, items: list[tuple[str, str, str]]
+        self, batch_id: str, items: list[tuple[str, str, str, str]]
     ) -> None:
         """登记 C-FIND 固定下来的 SOP 清单。
 
-        ``items`` 元素为 ``(sop_instance_uid, sop_class_uid, transfer_syntax)``。
-        同一批只允许固定一次。
+        ``items`` 元素为 ``(sop_instance_uid, sop_class_uid, transfer_syntax,
+        series_instance_uid)``。同一批只允许固定一次。
         """
         with self._lock, self._conn:
             exists = self._conn.execute(
@@ -235,8 +290,9 @@ class Database:
                 raise RuntimeError("manifest already fixed")
             self._conn.executemany(
                 "INSERT INTO instances(batch_id, sop_instance_uid, sop_class_uid, "
-                "transfer_syntax, file_path, received_at) VALUES (?, ?, ?, ?, '', '')",
-                [(batch_id, sop, cls, ts) for sop, cls, ts in items],
+                "transfer_syntax, series_instance_uid, file_path, received_at) "
+                "VALUES (?, ?, ?, ?, ?, '', '')",
+                [(batch_id, sop, cls, ts, series) for sop, cls, ts, series in items],
             )
             self._conn.execute(
                 "UPDATE batches SET expected_count = ?, updated_at = ? WHERE id = ?",
@@ -320,6 +376,41 @@ class Database:
             ).fetchall()
         return [(r["sop_instance_uid"], r["file_path"]) for r in rows]
 
+    # ------------------------------------------------------------------ series
+    def series_uids_for_batch(self, batch_id: str) -> set[str]:
+        """批清单中登记过的全部 SeriesInstanceUID（空串除外）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT series_instance_uid FROM instances "
+                "WHERE batch_id = ? AND series_instance_uid != ''",
+                (batch_id,),
+            ).fetchall()
+        return {r["series_instance_uid"] for r in rows}
+
+    def received_rows_missing_series(self, batch_id: str) -> list[tuple[str, str]]:
+        """已收但缺序列标识的实例 ``(sop_instance_uid, file_path)``。
+
+        老库升级或源端 C-FIND 未返回 SeriesInstanceUID 时出现；
+        由 storage 层读 DICOM 文件头回填。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT sop_instance_uid, file_path FROM instances "
+                "WHERE batch_id = ? AND file_path != '' AND series_instance_uid = ''",
+                (batch_id,),
+            ).fetchall()
+        return [(r["sop_instance_uid"], r["file_path"]) for r in rows]
+
+    def update_instance_series(
+        self, batch_id: str, sop_uid: str, series_uid: str
+    ) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE instances SET series_instance_uid = ? "
+                "WHERE batch_id = ? AND sop_instance_uid = ?",
+                (series_uid, batch_id, sop_uid),
+            )
+
     def find_batch_for_study(self, study_uid: str) -> dict[str, Any] | None:
         """按 StudyInstanceUID 路由 C-STORE 回传到对应批。
 
@@ -333,6 +424,182 @@ class Database:
                 (study_uid,),
             ).fetchone()
         return dict(row) if row else None
+
+    def latest_completed_batch_for_study(
+        self, study_uid: str
+    ) -> dict[str, Any] | None:
+        """该检查最近一次成功取数的批（剂量归集只认已完成批）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM batches WHERE study_instance_uid = ? AND state = ? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (study_uid, STATE_COMPLETED),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def has_any_batch_for_study(self, study_uid: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM batches WHERE study_instance_uid = ? LIMIT 1",
+                (study_uid,),
+            ).fetchone()
+        return row is not None
+
+    # ------------------------------------------------------------------ dose
+    def next_dose_version(self, study_uid: str) -> int:
+        """下一个剂量版本号（调用方须持有修订锁，保证并发修订不撞号）。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM dose_versions "
+                "WHERE study_instance_uid = ?",
+                (study_uid,),
+            ).fetchone()
+        return int(row["v"]) + 1
+
+    def publish_dose_version(
+        self,
+        study_uid: str,
+        version: int,
+        batch_id: str,
+        export_id: str,
+        events: list[dict[str, Any]],
+        total_dlp: float,
+        series_count: int,
+        raw_path: str,
+    ) -> None:
+        """把一版剂量导出发布为当前版本。
+
+        版本行 + 事件行 + 当前版本指针在**同一事务**提交：
+        任何时刻读者看到的都是完整版本，绝不出现“汇总是新版、
+        原件是旧版”的混合状态。事务失败整体回滚，当前版本不变。
+        """
+        now = _now()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO dose_versions(study_instance_uid, version, batch_id, "
+                "export_id, event_count, series_count, total_dlp_mgy_cm, "
+                "raw_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (study_uid, version, batch_id, export_id, len(events),
+                 series_count, total_dlp, raw_path, now),
+            )
+            self._conn.executemany(
+                "INSERT INTO dose_events(study_instance_uid, version, "
+                "irradiation_event_uid, series_instance_uid, ctdi_vol_mgy, "
+                "dlp_mgy_cm, seq) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (study_uid, version, e["irradiation_event_uid"],
+                     e["series_instance_uid"], e["ctdi_vol_mgy"],
+                     e["dlp_mgy_cm"], seq)
+                    for seq, e in enumerate(events)
+                ],
+            )
+            self._conn.execute(
+                "INSERT INTO dose_current(study_instance_uid, version, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(study_instance_uid) DO UPDATE SET "
+                "version = excluded.version, updated_at = excluded.updated_at",
+                (study_uid, version, now),
+            )
+        self.add_event(
+            "DOSE_PUBLISHED",
+            f"剂量导出第 {version} 版已发布：{len(events)} 个照射事件，"
+            f"DLP 合计 {total_dlp:.1f} mGy·cm（汇总与原件同版原子生效）",
+            batch_id,
+        )
+
+    def current_dose_version(self, study_uid: str) -> dict[str, Any] | None:
+        """当前版本指针指向的版本行。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT v.* FROM dose_current c "
+                "JOIN dose_versions v ON v.study_instance_uid = c.study_instance_uid "
+                "AND v.version = c.version "
+                "WHERE c.study_instance_uid = ?",
+                (study_uid,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def dose_version(
+        self, study_uid: str, version: int
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM dose_versions "
+                "WHERE study_instance_uid = ? AND version = ?",
+                (study_uid, version),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def dose_events(
+        self, study_uid: str, version: int
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT irradiation_event_uid, series_instance_uid, "
+                "ctdi_vol_mgy, dlp_mgy_cm, seq FROM dose_events "
+                "WHERE study_instance_uid = ? AND version = ? ORDER BY seq",
+                (study_uid, version),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_dose_versions(self, study_uid: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dose_versions WHERE study_instance_uid = ? "
+                "ORDER BY version DESC",
+                (study_uid,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_current_doses(self) -> list[dict[str, Any]]:
+        """全部已归集检查的当前剂量版本（列表页用）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT c.study_instance_uid, c.version, c.updated_at, "
+                "v.batch_id, v.event_count, v.series_count, v.total_dlp_mgy_cm "
+                "FROM dose_current c "
+                "JOIN dose_versions v ON v.study_instance_uid = c.study_instance_uid "
+                "AND v.version = c.version "
+                "ORDER BY c.updated_at DESC",
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def all_dose_versions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM dose_versions ORDER BY study_instance_uid, version"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def drop_dose_version(self, study_uid: str, version: int) -> None:
+        """删除残缺版本（如原件文件损坏），并把当前指针回退到最新完整版。
+
+        仅用于启动恢复；正常流程中版本不可变、不删除。
+        """
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM dose_versions WHERE study_instance_uid = ? AND version = ?",
+                (study_uid, version),
+            )
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM dose_versions "
+                "WHERE study_instance_uid = ?",
+                (study_uid,),
+            ).fetchone()
+            remaining = int(row["v"])
+            if remaining:
+                self._conn.execute(
+                    "INSERT INTO dose_current(study_instance_uid, version, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(study_instance_uid) DO UPDATE SET "
+                    "version = excluded.version, updated_at = excluded.updated_at",
+                    (study_uid, remaining, _now()),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM dose_current WHERE study_instance_uid = ?",
+                    (study_uid,),
+                )
 
     # ------------------------------------------------------------------ recovery
     def non_terminal_batches(self) -> list[dict[str, Any]]:

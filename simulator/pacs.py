@@ -74,20 +74,23 @@ class Registry:
                 instances.append({
                     "sop_uid": str(meta.SOPInstanceUID),
                     "sop_class": str(meta.SOPClassUID),
+                    "series_uid": str(getattr(meta, "SeriesInstanceUID", "")),
                     "transfer_syntax": str(
                         meta.file_meta.TransferSyntaxUID
                     ),
                     "path": f,
                 })
+            series_uids = sorted({i["series_uid"] for i in instances})
             self.studies[study_uid] = {
                 "study_uid": study_uid,
-                "series_uid": str(probe.SeriesInstanceUID),
+                "series_uids": series_uids,
                 "patient_id": str(getattr(probe, "PatientID", "")),
                 "patient_name": str(getattr(probe, "PatientName", "")),
                 "modality": str(getattr(probe, "Modality", "CT")),
                 "instances": instances,
             }
-            log.info("索引检查 %s：%d 个实例", study_uid, len(instances))
+            log.info("索引检查 %s：%d 个实例 / %d 个序列",
+                     study_uid, len(instances), len(series_uids))
 
     def find_study(self, study_uid: str) -> dict | None:
         return self.studies.get(study_uid)
@@ -104,7 +107,7 @@ def handle_echo(event: evt.Event) -> int:
 
 
 def handle_find(event: evt.Event):
-    """Study Root C-FIND，支持 STUDY 与 IMAGE 两级。"""
+    """Study Root C-FIND，支持 STUDY / SERIES / IMAGE 三级。"""
     ident: Dataset = event.identifier
     level = str(getattr(ident, "QueryRetrieveLevel", "")).upper()
     want_study = str(getattr(ident, "StudyInstanceUID", "") or "")
@@ -129,9 +132,27 @@ def handle_find(event: evt.Event):
             rsp.PatientName = study["patient_name"]
             rsp.Modality = study["modality"]
             rsp.NumberOfStudyRelatedInstances = len(study["instances"])
-            rsp.NumberOfStudyRelatedSeries = 1
+            rsp.NumberOfStudyRelatedSeries = len(study["series_uids"])
             rsp.RetrieveAETitle = PACS_AET
             yield 0xFF00, rsp
+            continue
+
+        if level == "SERIES":
+            for series_uid in study["series_uids"]:
+                if event.is_cancelled:
+                    yield 0xFE00, None
+                    return
+                rsp = Dataset()
+                rsp.QueryRetrieveLevel = "SERIES"
+                rsp.StudyInstanceUID = study["study_uid"]
+                rsp.SeriesInstanceUID = series_uid
+                rsp.Modality = study["modality"]
+                rsp.NumberOfSeriesRelatedInstances = sum(
+                    1 for i in study["instances"]
+                    if i["series_uid"] == series_uid
+                )
+                rsp.RetrieveAETitle = PACS_AET
+                yield 0xFF00, rsp
             continue
 
         if level == "IMAGE":
@@ -142,7 +163,7 @@ def handle_find(event: evt.Event):
                 rsp = Dataset()
                 rsp.QueryRetrieveLevel = "IMAGE"
                 rsp.StudyInstanceUID = study["study_uid"]
-                rsp.SeriesInstanceUID = study["series_uid"]
+                rsp.SeriesInstanceUID = inst["series_uid"]
                 rsp.SOPInstanceUID = inst["sop_uid"]
                 rsp.SOPClassUID = inst["sop_class"]
                 rsp.TransferSyntaxUID = inst["transfer_syntax"]

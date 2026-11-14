@@ -142,3 +142,106 @@ def build_zip(batch_id: str) -> Path:
     os.replace(tmp_zip, zip_path)
     _fsync_dir(settings.ZIP_DIR)
     return zip_path
+
+
+# ============================================================ 剂量导出原件
+def dose_study_dir(study_uid: str) -> Path:
+    d = settings.DOSE_DIR / study_uid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def dose_raw_path(study_uid: str, version: int) -> Path:
+    return settings.DOSE_DIR / study_uid / f"v{version}.json"
+
+
+def write_dose_raw(study_uid: str, version: int, raw: bytes) -> Path:
+    """原子化落盘剂量导出原件：临时文件 → fsync → rename → 目录 fsync。
+
+    与 :func:`write_dataset` 同一套纪律：调用方在文件落盘后才做 DB 登记，
+    保证“原件写完且登记成功才对外可见新版本”。
+    """
+    d = dose_study_dir(study_uid)
+    final = d / f"v{version}.json"
+    tmp = d / f"v{version}.json.part"
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, final)
+        _fsync_dir(d)
+        return final
+    except (OSError, PermissionError) as exc:
+        for p in (tmp, final):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        raise StorageError(f"剂量原件写入失败：{exc}") from exc
+
+
+def remove_dose_raw(path: Path) -> None:
+    """登记失败/启动清理时删除未引用的原件文件（尽力而为）。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("无法删除剂量原件 %s", path)
+
+
+def cleanup_dose_orphans(valid_paths: set[str]) -> list[str]:
+    """删除数据卷中未被任何已登记版本引用的剂量文件。
+
+    崩溃可能留下“文件已写完但 DB 未提交”的孤儿文件；它们从未被
+    当前版本指针引用，删除不影响任何已发布版本。返回删除的路径。
+    """
+    removed: list[str] = []
+    root = settings.DOSE_DIR
+    if not root.exists():
+        return removed
+    for f in sorted(root.rglob("*.json*")):
+        if not f.is_file():
+            continue
+        if str(f) in valid_paths:
+            continue
+        try:
+            f.unlink()
+            removed.append(str(f))
+        except OSError:
+            log.warning("无法清理孤儿剂量文件 %s", f)
+    # 清理空目录
+    for d in sorted((p for p in root.rglob("*") if p.is_dir()),
+                    key=lambda p: -len(p.parts)):
+        try:
+            d.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
+def backfill_series_for_batch(db, batch_id: str) -> int:
+    """从已落盘 DICOM 文件头回填缺失的 SeriesInstanceUID。
+
+    老库升级或源端 C-FIND 未返回序列号时，剂量校验需要完整的序列集合；
+    以已登记文件为准回填。返回回填条数。
+    """
+    import pydicom  # 局部导入，保持模块加载轻量
+
+    filled = 0
+    for sop_uid, file_path in db.received_rows_missing_series(batch_id):
+        try:
+            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            series = str(getattr(ds, "SeriesInstanceUID", "") or "")
+        except Exception as exc:
+            log.warning("回填序列号失败 %s：%s", file_path, exc)
+            continue
+        if series:
+            db.update_instance_series(batch_id, sop_uid, series)
+            filled += 1
+    if filled:
+        db.add_event(
+            "SERIES_BACKFILLED",
+            f"从已登记 DICOM 文件回填 {filled} 条序列标识",
+            batch_id,
+        )
+    return filled

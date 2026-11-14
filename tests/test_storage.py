@@ -25,6 +25,7 @@ def workspace(tmp_path, monkeypatch):
     monkeypatch.setattr(Settings, "DB_PATH", data / "retrieval.db")
     monkeypatch.setattr(Settings, "BATCHES_DIR", data / "batches")
     monkeypatch.setattr(Settings, "ZIP_DIR", data / "zips")
+    monkeypatch.setattr(Settings, "DOSE_DIR", data / "dose")
     Settings.ensure_dirs()
     db = Database(Settings.DB_PATH)
     set_db(db)
@@ -62,8 +63,8 @@ def test_write_and_zip_only_contains_registered(workspace):
     db.create_batch("b1", "1.2.3.9", "")
     db.transition_state("b1", ["PENDING"], "FINDING")
     db.set_manifest("b1", [
-        ("1.2.3.4", str(CTImageStorage), str(ExplicitVRLittleEndian)),
-        ("1.2.3.5", str(CTImageStorage), str(ExplicitVRLittleEndian)),
+        ("1.2.3.4", str(CTImageStorage), str(ExplicitVRLittleEndian), "1.2.3.8"),
+        ("1.2.3.5", str(CTImageStorage), str(ExplicitVRLittleEndian), "1.2.3.8"),
     ])
     db.transition_state("b1", ["FINDING"], "MOVING")
 

@@ -197,10 +197,13 @@ def _scp_ae(timeout: int | None = None) -> AE:
     return ae
 
 
-def c_find_study(study_uid: str) -> list[tuple[str, str, str]]:
-    """IMAGE 级 C-FIND，返回 ``(SOPInstanceUID, SOPClassUID, TransferSyntax)``。
+def c_find_study(study_uid: str) -> list[tuple[str, str, str, str]]:
+    """IMAGE 级 C-FIND，返回 ``(SOPInstanceUID, SOPClassUID, TransferSyntax,
+    SeriesInstanceUID)``。
 
     只保留非压缩 CT 实例；要求源端返回 QueryRetrieveLevel=IMAGE 的标识符。
+    序列号用于剂量导出的“序列须与已登记 DICOM 一致”校验；源端不返回时
+    为空串，后续由 storage 层从已落盘文件头回填。
     """
     ae = _scp_ae()
     ae.requested_contexts = [
@@ -216,6 +219,7 @@ def c_find_study(study_uid: str) -> list[tuple[str, str, str]]:
         identifier = Dataset()
         identifier.QueryRetrieveLevel = "IMAGE"
         identifier.StudyInstanceUID = study_uid
+        identifier.SeriesInstanceUID = ""
         identifier.SOPInstanceUID = ""
         identifier.SOPClassUID = ""
         identifier.TransferSyntaxUID = ""
@@ -223,7 +227,7 @@ def c_find_study(study_uid: str) -> list[tuple[str, str, str]]:
         identifier.Rows = ""
         identifier.Columns = ""
 
-        results: list[tuple[str, str, str]] = []
+        results: list[tuple[str, str, str, str]] = []
         failure_status: int | None = None
         for status_ds, rsp_identifier in assoc.send_c_find(
             identifier, str(StudyRootQueryRetrieveInformationModelFind)
@@ -242,15 +246,17 @@ def c_find_study(study_uid: str) -> list[tuple[str, str, str]]:
             if ts not in [str(ImplicitVRLittleEndian), str(ExplicitVRLittleEndian)]:
                 continue
             sop_uid = str(rsp_identifier.SOPInstanceUID)
-            results.append((sop_uid, sop_class, ts))
+            series_uid = str(getattr(rsp_identifier, "SeriesInstanceUID", "") or "")
+            results.append((sop_uid, sop_class, ts, series_uid))
 
         if failure_status is not None:
             raise FindError(f"C-FIND 返回失败状态 0x{failure_status:04X}")
         if not results:
             raise FindError("C-FIND 未找到任何非压缩 CT 实例")
         # 源端批内不增删实例；去重保护
-        deduped = {sop: (cls, ts) for sop, cls, ts in results}
-        return [(sop, cls, ts) for sop, (cls, ts) in sorted(deduped.items())]
+        deduped = {sop: (cls, ts, series) for sop, cls, ts, series in results}
+        return [(sop, cls, ts, series)
+                for sop, (cls, ts, series) in sorted(deduped.items())]
     finally:
         if assoc.is_alive:
             assoc.release()

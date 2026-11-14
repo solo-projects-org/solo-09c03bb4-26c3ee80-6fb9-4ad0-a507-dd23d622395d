@@ -22,7 +22,7 @@ def db(tmp_path):
 
 
 def _manifest(n: int):
-    return [(f"1.2.3.{i}", CT, TS) for i in range(n)]
+    return [(f"1.2.3.{i}", CT, TS, f"1.2.9.{i % 2}") for i in range(n)]
 
 
 def test_lifecycle_and_terminal_immutability(db):

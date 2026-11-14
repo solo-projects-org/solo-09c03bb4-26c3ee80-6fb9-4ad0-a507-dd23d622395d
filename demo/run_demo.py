@@ -7,8 +7,10 @@
 3. 回传进行中投送“清单外实例”和“压缩实例”，验证均被拒收、不入包
 4. 提交一个 save_failure 批，验证保存失败即批失败、C-STORE 回失败码
 5. 轮询进度，下载完成批 ZIP 并校验实例数与清单一致
-6. 重启恢复演示：制造一个未完成批后调用进程退出，验证重启后该批判失败、
-   已完成批仍可下载
+6. 剂量归集：提交扫描仪剂量导出 → 按序列汇总；完全一致重复计一次、
+   冲突重复/未登记序列整份拒绝；修订发布新版本且旧版可查；原件逐字节留存
+7. 重启恢复演示：制造一个未完成批后调用进程退出，验证重启后该批判失败、
+   已完成批仍可下载、已发布剂量版本完好
 
 运行::
 
@@ -69,11 +71,12 @@ def main() -> int:
     studies = requests.get(f"{API}/internal/pacs-studies", timeout=20).json()
     for s in studies:
         print(f"    Study={s['study_instance_uid']} 患者={s['patient_name']} "
-              f"实例数={s['instances']}")
+              f"实例数={s['instances']} 序列数={len(s.get('series', []))}")
     if len(studies) < 3:
         print("PACS 至少需要 3 个检查")
         return 1
     study_a, study_b, study_c = (s["study_instance_uid"] for s in studies[:3])
+    series_a = studies[0]["series"]
 
     banner("2. 并行提交批 A（含源端重复投送）与批 B，验证交错回传互不阻塞")
     # 批 A 的重复投送由 PACS 环境变量 MOVE_DUPLICATE_EVERY=3 控制
@@ -153,11 +156,82 @@ def main() -> int:
     print(f"    失败批 C 下载 HTTP 状态={denied.status_code}（期望 409）")
     assert denied.status_code == 409
 
+    banner("7. 剂量归集：扫描仪剂量导出按序列汇总、版本化发布")
+    from simulator import dose_export
+
+    # 7.1 提交首份导出（扫描仪导出件，此处按同一确定性规则现场构造）
+    export = dose_export.build_dose_export(study_a, series_a)
+    r = requests.post(f"{API}/dose-exports", json=export, timeout=10)
+    assert r.status_code == 201, r.text
+    v1 = r.json()
+    print(f"    导出已受理为 v{v1['version']}：事件={v1['event_count']} "
+          f"DLP 合计={v1['total_dlp_mgy_cm']} mGy·cm")
+    for s in v1["series"]:
+        print(f"      序列 {s['series_instance_uid']}："
+              f"{s['event_count']} 个事件，DLP={s['total_dlp_mgy_cm']}，"
+              f"最大 CTDIvol={s['max_ctdi_vol_mgy']} mGy")
+
+    # 7.2 完全一致的重复事件：只计一次
+    dup = dose_export.with_identical_duplicates(export)
+    r = requests.post(f"{API}/dose-exports", json=dup, timeout=10)
+    assert r.status_code == 201, r.text
+    v2 = r.json()
+    print(f"    含完全一致重复的导出 -> v{v2['version']}，"
+          f"事件数仍为 {v2['event_count']}（重复只计一次）")
+    assert v2["event_count"] == v1["event_count"]
+    assert v2["total_dlp_mgy_cm"] == v1["total_dlp_mgy_cm"]
+
+    # 7.3 冲突重复 / 未登记序列：整份拒绝，当前版本不变
+    conflict = dose_export.with_conflicting_duplicate(export)
+    r = requests.post(f"{API}/dose-exports", json=conflict, timeout=10)
+    print(f"    冲突重复导出 HTTP 状态={r.status_code}（期望 422，整份拒绝）")
+    assert r.status_code == 422
+    bogus = dose_export.with_unknown_series(
+        export, "1.2.826.0.1.3680043.8.498.999999")
+    r = requests.post(f"{API}/dose-exports", json=bogus, timeout=10)
+    print(f"    未登记序列导出 HTTP 状态={r.status_code}（期望 422，整份拒绝）")
+    assert r.status_code == 422
+    cur = requests.get(f"{API}/dose-exports/{study_a}", timeout=10).json()
+    assert cur["version"] == v2["version"], "被拒导出不得产生新版本"
+
+    # 7.4 修订：汇总与原件作为同一版发布，旧版仍可查
+    revision = dose_export.revised_export(export)
+    r = requests.post(f"{API}/dose-exports", json=revision, timeout=10)
+    assert r.status_code == 201, r.text
+    v3 = r.json()
+    print(f"    修订导出 -> v{v3['version']}，DLP 合计="
+          f"{v3['total_dlp_mgy_cm']}（v1 为 {v1['total_dlp_mgy_cm']}）")
+    assert v3["version"] == v2["version"] + 1
+    versions = requests.get(f"{API}/dose-exports/{study_a}/versions",
+                            timeout=10).json()
+    print(f"    版本历史：{[(v['version'], v['is_current']) for v in versions]}")
+    old = requests.get(f"{API}/dose-exports/{study_a}/versions/1",
+                       timeout=10).json()
+    assert old["total_dlp_mgy_cm"] == v1["total_dlp_mgy_cm"], "旧版本不可变"
+
+    # 7.5 原件逐字节留存（溯源）
+    raw = requests.get(f"{API}/dose-exports/{study_a}/raw", timeout=10)
+    assert raw.status_code == 200
+    assert raw.json() == revision, "当前版本原件应与最近一次提交一致"
+    raw_v1 = requests.get(f"{API}/dose-exports/{study_a}/versions/1/raw",
+                          timeout=10)
+    assert raw_v1.json() == export, "v1 原件应保持首份导出原样"
+    print("    当前版与历史版原件均可逐字节回溯，校验通过")
+
+    # 7.6 未取数检查 / 未完成批不受理
+    r = requests.post(f"{API}/dose-exports",
+                      json=dose_export.build_dose_export(
+                          "1.2.826.0.1.3680043.8.498.424242",
+                          ["1.2.826.0.1.3680043.8.498.424243"]),
+                      timeout=10)
+    print(f"    未取数检查剂量导出 HTTP 状态={r.status_code}（期望 404）")
+    assert r.status_code == 404
+
     if args.skip_restart:
         banner("演示完成（已跳过重启恢复）")
         return 0
 
-    banner("7. 重启恢复：制造未完成批后重启进程")
+    banner("8. 重启恢复：制造未完成批后重启进程")
     # 再提交一个新检查的批，立刻杀掉进程，使其停在非终态。
     # 终态批已存在不影响重新提交（仅拒绝“进行中”的同 Study 批）。
     r_d = requests.post(f"{API}/batches",
@@ -196,6 +270,15 @@ def main() -> int:
             again = requests.get(f"{API}/batches/{batch_a}/download", timeout=30)
             print(f"    重启后已完成批 A 下载 HTTP 状态={again.status_code}（期望 200）")
             assert again.status_code == 200
+        # 已发布剂量版本在重启后保持完好（上次完整版本不丢）
+        dose_after = requests.get(f"{API}/dose-exports/{study_a}",
+                                  timeout=10).json()
+        print(f"    重启后剂量当前版本=v{dose_after['version']}，"
+              f"DLP 合计={dose_after['total_dlp_mgy_cm']}（应与重启前一致）")
+        assert dose_after["version"] == v3["version"]
+        assert dose_after["total_dlp_mgy_cm"] == v3["total_dlp_mgy_cm"]
+        raw_after = requests.get(f"{API}/dose-exports/{study_a}/raw", timeout=10)
+        assert raw_after.status_code == 200 and raw_after.json() == revision
 
     banner("全部演示完成")
     return 0

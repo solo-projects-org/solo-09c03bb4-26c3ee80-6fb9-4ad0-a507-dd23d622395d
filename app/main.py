@@ -1,15 +1,16 @@
 """FastAPI 入口：批管理 REST API + Swagger 文档 + DICOM 服务生命周期。"""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from . import dicom, storage
 from .config import settings
@@ -18,6 +19,7 @@ from .db import (
     Database,
     set_db,
 )
+from .dose import DoseError, DoseService
 from .pipeline import Pipeline, recover_on_startup
 
 logging.basicConfig(
@@ -29,16 +31,18 @@ log = logging.getLogger("api")
 # 进程级单例（lifespan 中初始化）
 db: Database | None = None
 pipeline: Pipeline | None = None
+dose_service: DoseService | None = None
 _scp_server = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global db, pipeline, _scp_server
+    global db, pipeline, dose_service, _scp_server
     settings.ensure_dirs()
     db = Database(settings.DB_PATH)
     set_db(db)
     recover_on_startup(db)
+    dose_service = DoseService(db)
     _scp_server = dicom.start_store_scp(db)
     pipeline = Pipeline(db)
     log.info("API 就绪，数据卷=%s", settings.DATA_DIR)
@@ -53,13 +57,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="DICOM CT 离线取数流水线",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     description=(
         "提交 StudyInstanceUID → C-FIND 固定 SOP 清单 → C-MOVE 回传 → "
         "C-STORE 接收非压缩 CT → 核对收齐后打包 ZIP 下载。\n\n"
         "规则：清单外实例不入包、重复实例不重复计数、保存失败即批失败、"
-        "失败批迟到回传不可恢复、重启后未完成批判失败。"
+        "失败批迟到回传不可恢复、重启后未完成批判失败。\n\n"
+        "剂量归集：扫描仪导出的 CT 剂量 JSON 按检查归集到已完成批，"
+        "按序列汇总照射事件与 DLP；同一照射事件仅在归属和剂量完全一致时"
+        "计一次，冲突则整份拒绝；每次受理发布为新的版本，汇总与原件同版"
+        "原子生效，失败或重启保留上次完整版本。"
     ),
 )
 
@@ -191,9 +199,180 @@ def health() -> dict:
             "ae_title": settings.APP_AET}
 
 
+# ============================================================ 剂量归集
+class DoseEventIn(BaseModel):
+    irradiation_event_uid: str = Field(
+        ..., min_length=1, max_length=256, description="照射事件 UID",
+        examples=["1.2.826.0.1.3680043.8.498.1001.dose.1"],
+    )
+    series_instance_uid: str = Field(
+        ..., min_length=1, max_length=256, description="事件归属的 SeriesInstanceUID",
+        examples=["1.2.826.0.1.3680043.8.498.2001"],
+    )
+    ctdi_vol_mgy: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="容积 CT 剂量指数（mGy）",
+        examples=[12.4],
+    )
+    dlp_mgy_cm: float = Field(
+        ..., ge=0, allow_inf_nan=False, description="剂量长度乘积（mGy·cm）",
+        examples=[384.6],
+    )
+
+
+class DoseExportIn(BaseModel):
+    """扫描仪导出的一整份 CT 剂量 JSON（整份受理或整份拒绝）。"""
+
+    study_instance_uid: str = Field(
+        ..., min_length=1, max_length=256, description="检查 StudyInstanceUID",
+        examples=["1.2.826.0.1.3680043.8.498.1001"],
+    )
+    export_id: str = Field(
+        default="", max_length=256,
+        description="扫描仪侧导出标识（可选，随原件留存供溯源）",
+        examples=["CT-EXPORT-20261101-001"],
+    )
+    events: list[DoseEventIn] = Field(
+        ..., min_length=1, description="照射事件列表（同一事件重复须完全一致）",
+    )
+
+
+class DoseEventView(BaseModel):
+    irradiation_event_uid: str
+    ctdi_vol_mgy: float
+    dlp_mgy_cm: float
+
+
+class DoseSeriesView(BaseModel):
+    series_instance_uid: str
+    event_count: int
+    total_dlp_mgy_cm: float
+    max_ctdi_vol_mgy: float
+    events: list[DoseEventView]
+
+
+class DoseVersionView(BaseModel):
+    study_instance_uid: str
+    version: int
+    batch_id: str
+    export_id: str
+    created_at: str
+    event_count: int
+    series_count: int
+    total_dlp_mgy_cm: float
+    series: list[DoseSeriesView]
+    raw_download: str
+
+
+class DoseVersionListItem(BaseModel):
+    version: int
+    batch_id: str
+    export_id: str
+    event_count: int
+    series_count: int
+    total_dlp_mgy_cm: float
+    created_at: str
+    is_current: bool
+
+
+class DoseStudyItem(BaseModel):
+    study_instance_uid: str
+    version: int
+    batch_id: str
+    event_count: int
+    series_count: int
+    total_dlp_mgy_cm: float
+    updated_at: str
+
+
+def _dose_call(fn, *args):
+    """把 DoseError 映射为对应 HTTP 状态。"""
+    try:
+        return fn(*args)
+    except DoseError as exc:
+        raise HTTPException(exc.status_code, exc.message) from exc
+
+
+@app.post("/dose-exports", response_model=DoseVersionView, status_code=201,
+          tags=["dose"],
+          summary="提交扫描仪剂量导出（整份受理为新版本，冲突整份拒绝）")
+async def submit_dose_export(request: Request) -> DoseVersionView:
+    from starlette.concurrency import run_in_threadpool
+
+    raw = await request.body()
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(422, f"请求体不是合法 JSON：{exc}") from exc
+    try:
+        payload = DoseExportIn.model_validate(obj)
+    except ValidationError as exc:
+        raise HTTPException(422, f"剂量导出格式不符：{exc.errors()}") from exc
+    # 落盘与修订锁可能阻塞，放到线程池，避免卡住事件循环
+    view = await run_in_threadpool(
+        _dose_call,
+        dose_service.submit,
+        payload.study_instance_uid,
+        payload.export_id,
+        [e.model_dump() for e in payload.events],
+        raw,  # 原件按提交字节原样留存，供溯源下载
+    )
+    return DoseVersionView(**view)
+
+
+@app.get("/dose-exports", response_model=list[DoseStudyItem],
+         tags=["dose"], summary="列出已有剂量归集的检查及当前版本")
+def list_dose_studies() -> list[DoseStudyItem]:
+    return [DoseStudyItem(**r) for r in db.all_current_doses()]
+
+
+@app.get("/dose-exports/{study_uid}", response_model=DoseVersionView,
+         tags=["dose"], summary="查询该检查当前版本的按序列剂量汇总")
+def get_current_dose(study_uid: str) -> DoseVersionView:
+    return DoseVersionView(**_dose_call(dose_service.current_view, study_uid))
+
+
+@app.get("/dose-exports/{study_uid}/versions",
+         response_model=list[DoseVersionListItem],
+         tags=["dose"], summary="列出该检查的全部剂量版本（修订历史）")
+def get_dose_versions(study_uid: str) -> list[DoseVersionListItem]:
+    versions = dose_service.versions(study_uid)
+    if not versions:
+        raise HTTPException(404, f"检查 {study_uid} 尚未归集剂量导出")
+    return [DoseVersionListItem(**v) for v in versions]
+
+
+@app.get("/dose-exports/{study_uid}/versions/{version}",
+         response_model=DoseVersionView,
+         tags=["dose"], summary="查询指定版本的按序列剂量汇总")
+def get_dose_version(study_uid: str, version: int) -> DoseVersionView:
+    return DoseVersionView(
+        **_dose_call(dose_service.version_view, study_uid, version)
+    )
+
+
+@app.get("/dose-exports/{study_uid}/versions/{version}/raw",
+         tags=["dose"], summary="下载指定版本的剂量导出原件（溯源）")
+def get_dose_version_raw(study_uid: str, version: int) -> FileResponse:
+    path = _dose_call(dose_service.raw_path, study_uid, version)
+    return FileResponse(
+        path, media_type="application/json",
+        filename=f"dose_{study_uid}_v{version}.json",
+    )
+
+
+@app.get("/dose-exports/{study_uid}/raw",
+         tags=["dose"], summary="下载当前版本的剂量导出原件（溯源）")
+def get_current_dose_raw(study_uid: str) -> FileResponse:
+    path = _dose_call(dose_service.current_raw_path, study_uid)
+    return FileResponse(
+        path, media_type="application/json",
+        filename=f"dose_{study_uid}_{path.stem}.json",
+    )
+
+
 # ------------------------------------------------------------------ debug
 @app.get("/internal/pacs-studies", tags=["internal"],
-         summary="（演示用）STUDY 级 C-FIND 列出模拟 PACS 中的检查")
+         summary="（演示用）STUDY/SERIES 级 C-FIND 列出模拟 PACS 中的检查与序列")
 def pacs_studies() -> list[dict]:
     from pydicom.dataset import Dataset
     from pydicom.uid import ExplicitVRLittleEndian, ImplicitVRLittleEndian
@@ -229,7 +408,23 @@ def pacs_studies() -> list[dict]:
                 "patient_name": str(getattr(ident, "PatientName", "")),
                 "modality": str(getattr(ident, "Modality", "")),
                 "instances": int(getattr(ident, "NumberOfStudyRelatedInstances", 0) or 0),
+                "series": [],
             })
+        # SERIES 级查询补齐每个检查的序列清单（剂量演示按序列构造导出）
+        for study in out:
+            sq = Dataset()
+            sq.QueryRetrieveLevel = "SERIES"
+            sq.StudyInstanceUID = study["study_instance_uid"]
+            sq.SeriesInstanceUID = ""
+            sq.Modality = ""
+            for status, ident in assoc.send_c_find(
+                sq, str(StudyRootQueryRetrieveInformationModelFind)
+            ):
+                if ident is None:
+                    continue
+                series_uid = str(getattr(ident, "SeriesInstanceUID", "") or "")
+                if series_uid:
+                    study["series"].append(series_uid)
         return out
     finally:
         if assoc.is_alive:

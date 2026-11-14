@@ -138,7 +138,7 @@ class Pipeline:
 
 # ---------------------------------------------------------------- recovery
 def recover_on_startup(db: Database) -> None:
-    """重启恢复：未完成批一律失败；完成批缺失 ZIP 则补建。"""
+    """重启恢复：未完成批一律失败；完成批缺失 ZIP 则补建；剂量版本对账。"""
     for batch in db.non_terminal_batches():
         db.fail_batch(
             batch["id"],
@@ -161,3 +161,13 @@ def recover_on_startup(db: Database) -> None:
                     batch["id"], [STATE_COMPLETED], STATE_FAILED,
                     failure_reason=f"重启后 ZIP 重建失败：{exc}",
                 )
+        # 老库/源端未返回序列号时，从已登记文件头回填，供剂量校验使用
+        try:
+            storage.backfill_series_for_batch(db, batch["id"])
+        except Exception:
+            log.exception("批 %s 序列号回填失败", batch["id"])
+
+    # 剂量版本对账：残缺版本回退指针、孤儿原件清理，已发布版本不受影响
+    from .dose import DoseService  # 局部导入避免循环依赖
+
+    DoseService(db).recover()

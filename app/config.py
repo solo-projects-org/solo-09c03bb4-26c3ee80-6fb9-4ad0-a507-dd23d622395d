@@ -33,12 +33,14 @@ class Settings:
     DB_PATH: Path = DATA_DIR / "retrieval.db"
     BATCHES_DIR: Path = DATA_DIR / "batches"
     ZIP_DIR: Path = DATA_DIR / "zips"
+    DOSE_DIR: Path = DATA_DIR / "dose"
 
     @classmethod
     def ensure_dirs(cls) -> None:
         cls.DATA_DIR.mkdir(parents=True, exist_ok=True)
         cls.BATCHES_DIR.mkdir(parents=True, exist_ok=True)
         cls.ZIP_DIR.mkdir(parents=True, exist_ok=True)
+        cls.DOSE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 settings = Settings()

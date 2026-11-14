@@ -26,6 +26,10 @@ PATIENT_NAMES = {
 }
 
 
+def _patient_name(study_index: int) -> str:
+    return PATIENT_NAMES.get(study_index, f"PHANTOM^Gen{study_index:03d}")
+
+
 def _make_uid(serial: int) -> str:
     return f"{UID_PREFIX}{serial}"
 
@@ -40,6 +44,9 @@ def build_ct_dataset(
     instance_count: int,
     rows: int = 64,
     cols: int = 64,
+    series_number: int = 1,
+    series_description: str = "Synthetic axial CT",
+    slice_thickness: float = 2.0,
 ) -> Dataset:
     """构造一个内存中的合成 CT Dataset（带 file_meta）。"""
     file_meta = FileMetaDataset()
@@ -72,8 +79,8 @@ def build_ct_dataset(
     ds.AccessionNumber = f"SIM{patient_id}"
     ds.StudyID = f"S{patient_id}"
     ds.StudyDescription = f"Synthetic CT demo study {patient_id}"
-    ds.SeriesNumber = 1
-    ds.SeriesDescription = "Synthetic axial CT"
+    ds.SeriesNumber = series_number
+    ds.SeriesDescription = series_description
     ds.InstanceNumber = instance_number
 
     ds.ImageType = ["ORIGINAL", "PRIMARY", "AXIAL"]
@@ -86,8 +93,8 @@ def build_ct_dataset(
     ds.Rows = rows
     ds.Columns = cols
     ds.PixelSpacing = [1.0, 1.0]
-    ds.SliceThickness = 2.0
-    ds.SliceLocation = (instance_number - 1 - instance_count / 2) * 2.0
+    ds.SliceThickness = slice_thickness
+    ds.SliceLocation = (instance_number - 1 - instance_count / 2) * slice_thickness
     ds.ImagePositionPatient = [0.0, 0.0, float(ds.SliceLocation)]
     ds.ImageOrientationPatient = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     ds.RescaleIntercept = -1024
@@ -114,34 +121,63 @@ def generate_study(
     out_dir: Path,
     study_index: int,
     instance_count: int,
+    series_count: int = 2,
 ) -> dict:
-    """生成一个检查的全部实例文件，返回检查元数据。"""
+    """生成一个检查的全部实例文件（均匀分布到多个序列），返回检查元数据。"""
     patient_id = f"P{study_index:03d}"
     study_uid = _make_uid(1000 + study_index)
-    series_uid = _make_uid(2000 + study_index)
+    # 序列 1 沿用老编号段（兼容既有演示数据卷），其余序列用 25xx 段
+    series_uids = [_make_uid(2000 + study_index)] + [
+        _make_uid(2500 + study_index * 10 + s) for s in range(1, series_count)
+    ]
+    series_descs = ["Synthetic axial CT", "Synthetic thin CT",
+                    "Synthetic topogram"]
     study_dir = out_dir / study_uid
     study_dir.mkdir(parents=True, exist_ok=True)
 
+    per_series = [
+        instance_count // series_count
+        + (1 if s < instance_count % series_count else 0)
+        for s in range(series_count)
+    ]
+    bounds = [sum(per_series[:s]) for s in range(series_count + 1)]
+
     for i in range(1, instance_count + 1):
+        s_idx = next(s for s in range(series_count)
+                     if bounds[s] < i <= bounds[s + 1])
         sop_uid = _make_uid(3000 + study_index * 100 + i)
         ds = build_ct_dataset(
             study_uid=study_uid,
-            series_uid=series_uid,
+            series_uid=series_uids[s_idx],
             sop_uid=sop_uid,
             patient_id=patient_id,
-            patient_name=PATIENT_NAMES[study_index],
+            patient_name=_patient_name(study_index),
             instance_number=i,
             instance_count=instance_count,
+            series_number=s_idx + 1,
+            series_description=series_descs[s_idx % len(series_descs)],
+            slice_thickness=2.0 if s_idx == 0 else 1.0,
         )
         ds.save_as(str(study_dir / f"{i:04d}.dcm"), enforce_file_format=True)
 
+    # 配套虚构剂量导出（扫描仪侧产物，供演示剂量归集）
+    from . import dose_export
+
+    dose = dose_export.build_dose_export(study_uid, series_uids)
+    import json
+
+    (study_dir / "dose_export.json").write_text(
+        json.dumps(dose, indent=2, ensure_ascii=False)
+    )
+
     return {
         "study_instance_uid": study_uid,
-        "series_instance_uid": series_uid,
+        "series_instance_uids": series_uids,
         "patient_id": patient_id,
-        "patient_name": PATIENT_NAMES[study_index],
+        "patient_name": _patient_name(study_index),
         "instances": instance_count,
         "directory": str(study_dir),
+        "dose_export": str(study_dir / "dose_export.json"),
     }
 
 
